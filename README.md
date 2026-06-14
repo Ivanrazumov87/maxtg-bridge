@@ -171,6 +171,8 @@ cp .env.example .env && nano .env
 Description=MAX <-> Telegram bridge
 After=network-online.target
 Wants=network-online.target
+# не сдаваться даже при частых перезапусках подряд — важно для стабильности 24/7
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -207,6 +209,10 @@ tail -f /var/log/maxtg.log      # смотреть логи
   запоминает связь `chat_id ⇄ message_thread_id` в файле `bridge_state.json`.
 - Связи и offset Telegram переживают перезапуск (хранятся на диске).
 - Приём из Telegram — long-polling (`getUpdates`), вебхук не нужен.
+- **Устойчивость 24/7:** при обрыве связи с MAX процесс чисто завершается, а
+  systemd мгновенно поднимает его заново (с чистым состоянием соединения).
+  Это надёжнее «реконнекта на лету», который мог зависать из-за гонок потоков.
+  Поэтому на сервере обязательны `Restart=always` и `StartLimitIntervalSec=0`.
 
 Файлы:
 - `main.py` — точка входа, обработчик сообщений MAX

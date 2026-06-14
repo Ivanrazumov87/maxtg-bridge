@@ -389,70 +389,35 @@ class MaxClient:
                         raise
 
             except (ConnectionClosedError, OSError) as e:
-                # Соединение оборвалось — пытаемся переподключиться, НЕ завершая
-                # listener (он продолжит читать новый сокет).
-                print("Соединение с MAX потеряно:", e)
-                if not self._reconnect():
-                    break  # остановлены извне (_t_stop)
-
-            except Exception as e:
-                # Прочие ошибки: если сокет жив — продолжаем, иначе реконнект
-                print("Ошибка listener:", e)
+                # Соединение оборвалось. Вместо хрупкого реконнекта "на лету"
+                # (который мог зависать из-за конкурирующих потоков/сокетов)
+                # ЧИСТО завершаем процесс — systemd (Restart=always) поднимет его
+                # заново с нуля за несколько секунд. Состояние (темы, offset) уже
+                # на диске, потерь нет. Это самый надёжный путь к работе 24/7.
                 if self._t_stop:
                     break
-                time.sleep(2)
-                continue
+                print(f"Соединение с MAX потеряно: {e}. Перезапуск процесса (systemd)...", flush=True)
+                self._exit_for_restart()
 
-    # region _reconnect()
-    def _reconnect(self) -> bool:
-        """
-        Переподключается к MAX после обрыва. Чистит состояние и повторяет
-        попытки с нарастающей паузой. Возвращает True при успехе, False если
-        клиент остановлен (_t_stop).
-        """
-        # сбрасываем зависшие ожидания ответов — на новом соединении seq другие
-        with self._pending_lock:
-            for slot in self._pending.values():
-                slot["event"].set()
-            self._pending.clear()
+            except Exception as e:
+                print("Ошибка listener:", e, flush=True)
+                if self._t_stop:
+                    break
+                print("Непредвиденная ошибка — перезапуск процесса (systemd)...", flush=True)
+                self._exit_for_restart()
 
-        self._connected = False
+    # region _exit_for_restart()
+    def _exit_for_restart(self):
+        """Чисто завершает процесс, чтобы systemd перезапустил его с нуля."""
+        import os
         try:
             if self.websocket:
                 self.websocket.close()
         except Exception:
             pass
-        self.websocket = None
-
-        delay = 3
-        attempt = 0
-        while not self._t_stop:
-            time.sleep(delay)
-            attempt += 1
-            try:
-                # гарантируем, что старый сокет закрыт перед новой попыткой
-                try:
-                    if self.websocket:
-                        self.websocket.close()
-                except Exception:
-                    pass
-                self.websocket = None
-                self._connected = False
-
-                self.connect(_reconnect=True)
-                print(f"Переподключение к MAX успешно (попытка {attempt})")
-                # поднимаем новый heartbeat (старый сам завершится по смене эпохи)
-                self._start_heartbeat()
-                return True
-            except Exception as ee:
-                # после серии неудач — длинная пауза (часто причина в том, что
-                # та же сессия MAX используется в браузере и перебивает бота)
-                if attempt >= 5:
-                    delay = 60
-                else:
-                    delay = min(delay + 5, 30)
-                print(f"Не смог встать (попытка {attempt}, следующая через {delay}с): {ee}")
-        return False
+        # небольшая пауза, чтобы лог успел сброситься
+        time.sleep(0.5)
+        os._exit(1)
 
     def _process_message(self, recv):
         """Process a single message"""
