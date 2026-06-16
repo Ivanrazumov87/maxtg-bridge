@@ -45,7 +45,8 @@ def handle_attach(attach: dict) -> str:
 
 # region send_video
 def send_video(token: str, chat_id: int | str, video_url: str, caption: str = "",
-               message_thread_id: int | None = None) -> dict:
+               message_thread_id: int | None = None,
+               disable_notification: bool = False) -> dict:
     """
     Отправляет видео в Telegram по URL (Telegram сам скачает его с video_url).
 
@@ -62,6 +63,8 @@ def send_video(token: str, chat_id: int | str, video_url: str, caption: str = ""
         data["parse_mode"] = "HTML"
     if message_thread_id is not None:
         data["message_thread_id"] = message_thread_id
+    if disable_notification:
+        data["disable_notification"] = True
     return _call(token, "sendVideo", data=data)
 
 
@@ -112,12 +115,15 @@ def send_to_telegram(
     caption: str = "",
     attachments: list[dict] = [],
     message_thread_id: int | None = None,
+    disable_notification: bool = False,
 ) -> dict | None:
     """
     Отправляет сообщение (текст и/или вложения) в чат Telegram.
 
     Если задан message_thread_id — сообщение уходит в соответствующий топик
-    форум-супергруппы.
+    форум-супергруппы. disable_notification=True — отправить «тихо» (без звука
+    и всплывающего уведомления); используется для собственных исходящих
+    сообщений пользователя.
     """
     if not attachments:  # нет вложений — просто текст
         if caption == "":
@@ -129,6 +135,8 @@ def send_to_telegram(
         }
         if message_thread_id is not None:
             data["message_thread_id"] = message_thread_id
+        if disable_notification:
+            data["disable_notification"] = True
         resp = _call(TG_BOT_TOKEN, "sendMessage", data=data)
         return resp
 
@@ -159,6 +167,7 @@ def send_to_telegram(
                         handle_attach(attach) for attach in not_handled_attachs
                     ),
                     message_thread_id=message_thread_id,
+                    disable_notification=disable_notification,
                 )
                 return None
 
@@ -168,6 +177,8 @@ def send_to_telegram(
         }
         if message_thread_id is not None:
             data["message_thread_id"] = message_thread_id
+        if disable_notification:
+            data["disable_notification"] = True
         resp = _call(TG_BOT_TOKEN, "sendMediaGroup", data=data)
         return resp
 
@@ -180,5 +191,6 @@ def send_to_telegram(
             caption if i == 0 else "",
             chunk,
             message_thread_id=message_thread_id,
+            disable_notification=disable_notification,
         )
     return None

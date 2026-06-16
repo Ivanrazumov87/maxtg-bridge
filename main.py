@@ -62,6 +62,9 @@ def onmessage(client: Client, message: Message):
                 forwarded_msg_author = client.get_user(id=message.kwargs["link"]["message"]["sender"], _f=1)
                 name = f"{name}\n(Переслано: {forwarded_msg_author.contact.names[0].name})"
 
+    # моё ли это исходящее сообщение (написал я сам) — такие шлём в Telegram тихо
+    is_own = client.me is not None and message.sender == client.me.contact.id
+
     if msg_text != "" or msg_attaches != []:
         bridge.on_max_message(
             name=name,
@@ -69,6 +72,7 @@ def onmessage(client: Client, message: Message):
             attaches=msg_attaches,
             max_chat_id=message.chat.id,
             cid=message.cid,
+            silent=is_own,
         )
 
 

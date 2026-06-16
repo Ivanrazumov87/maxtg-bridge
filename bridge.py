@@ -58,9 +58,12 @@ class Bridge:
             return topic
 
     # region MAX -> TG
-    def on_max_message(self, name: str, text: str, attaches: list, max_chat_id: int, cid):
+    def on_max_message(self, name: str, text: str, attaches: list, max_chat_id: int, cid, silent: bool = False):
         """
         Обрабатывает новое сообщение из MAX и пересылает в нужный топик Telegram.
+
+        silent=True — отправить в Telegram без уведомления (используется для
+        собственных исходящих сообщений пользователя).
 
         Возврат True, если переслали; False — если пропустили (эхо/ошибка).
         """
@@ -84,19 +87,19 @@ class Bridge:
         if caption.strip() or other:
             resp = telegram.send_to_telegram(
                 self.tg_token, self.tg_group_id, caption, other,
-                message_thread_id=topic,
+                message_thread_id=topic, disable_notification=silent,
             )
             if self._topic_gone(resp):
                 topic = self._recreate_topic(max_chat_id)
                 if topic is not None:
                     telegram.send_to_telegram(
                         self.tg_token, self.tg_group_id, caption, other,
-                        message_thread_id=topic,
+                        message_thread_id=topic, disable_notification=silent,
                     )
             caption = ""  # подпись уже отправлена, не дублируем у видео
 
         for v in videos:
-            self._forward_max_video(v, topic, caption)
+            self._forward_max_video(v, topic, caption, silent=silent)
             caption = ""
 
         return True
@@ -125,13 +128,14 @@ class Bridge:
             return topic
 
     # region forward MAX video
-    def _forward_max_video(self, attach: dict, topic: int, caption: str):
+    def _forward_max_video(self, attach: dict, topic: int, caption: str, silent: bool = False):
         """Получает URL видео из MAX и отправляет его в тему Telegram."""
         url = self.max.get_video_url(attach.get("videoId"), attach.get("token"))
         if url:
             resp = telegram.send_video(
                 self.tg_token, self.tg_group_id, url,
                 caption=caption, message_thread_id=topic,
+                disable_notification=silent,
             )
             if resp and resp.get("ok"):
                 return
@@ -141,7 +145,8 @@ class Bridge:
         if url:
             note += f"\n{url}"
         telegram.send_to_telegram(
-            self.tg_token, self.tg_group_id, note, message_thread_id=topic
+            self.tg_token, self.tg_group_id, note, message_thread_id=topic,
+            disable_notification=silent,
         )
 
     # region TG -> MAX
