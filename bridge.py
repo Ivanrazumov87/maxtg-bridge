@@ -12,6 +12,8 @@
 Защита от эхо-петли: cid сообщений, отправленных нами в MAX из Telegram,
 запоминается; их эхо (opcode 128) обратно в Telegram не пересылается.
 """
+import json
+import os
 import threading
 import time
 
@@ -21,6 +23,11 @@ from store import BridgeStore
 # Лимит Telegram Bot API на скачивание файлов ботом (~20 МБ). Файлы крупнее
 # getFile скачать не даёт ("file is too big") — такие пропускаем с уведомлением.
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024
+
+# Диагностика структуры входящих медиа MAX. Включается ENV MEDIA_DIAG=1 на время
+# отладки: печатает сырой attach (реальные имена полей фото/видео от сервера MAX).
+# По умолчанию выключено — payload содержит подписанные URL и токены.
+MEDIA_DIAG = bool(os.getenv("MEDIA_DIAG"))
 
 
 class Bridge:
@@ -54,6 +61,12 @@ class Bridge:
 
         caption = f"<b>{name}</b>\n{text}" if text else f"<b>{name}</b>"
 
+        # ДИАГ: печатаем сырую структуру входящих attach, чтобы увидеть реальные
+        # имена полей фото/видео от сервера MAX (для точной настройки парсинга).
+        if MEDIA_DIAG and attaches:
+            print("[media-diag] MAX->TG attaches:",
+                  json.dumps(attaches, ensure_ascii=False))
+
         # ВИДЕО из MAX обрабатываем отдельно: в attach нет прямой ссылки, поэтому
         # запрашиваем URL по videoId/token и отправляем через sendVideo.
         videos = [a for a in (attaches or []) if a.get("_type") == "VIDEO"]
@@ -74,9 +87,32 @@ class Bridge:
         return True
 
     # region forward MAX video
+    @staticmethod
+    def _extract_video_ids(attach: dict):
+        """
+        Достаёт (video_id, token) из входящего VIDEO-attach максимально терпимо.
+
+        Имена полей входящего видео от сервера MAX не подтверждены на живом
+        соединении, поэтому пробуем несколько вероятных ключей, а также
+        вложенный под-объект (с isinstance-guard, чтобы не упасть на не-dict).
+        """
+        video_id = attach.get("videoId") or attach.get("id") or attach.get("movieId")
+        token = attach.get("token") or attach.get("videoToken")
+        if video_id is None:
+            sub = attach.get("video")
+            if isinstance(sub, dict):
+                video_id = sub.get("videoId") or sub.get("id")
+                token = token or sub.get("token")
+        return video_id, token
+
     def _forward_max_video(self, attach: dict, caption: str, silent: bool = False):
         """Получает URL видео из MAX и отправляет его в группу Telegram."""
-        url = self.max.get_video_url(attach.get("videoId"), attach.get("token"))
+        video_id, token = self._extract_video_ids(attach)
+        if video_id is None:
+            # не смогли определить id — логируем сырой attach, чтобы понять схему
+            print("[bridge] VIDEO-attach без распознанного id:",
+                  json.dumps(attach, ensure_ascii=False))
+        url = self.max.get_video_url(video_id, token, diag=MEDIA_DIAG) if video_id is not None else None
         if url:
             resp = telegram.send_video(
                 self.tg_token, self.tg_group_id, url,
@@ -85,10 +121,9 @@ class Bridge:
             if resp and resp.get("ok"):
                 return
             print("[bridge] sendVideo не принял URL:", resp)
-        # фолбэк: хотя бы уведомим, что было видео (и дадим ссылку, если есть)
-        note = (caption + "\n" if caption else "") + "🎬 Видео из MAX"
-        if url:
-            note += f"\n{url}"
+        # фолбэк: уведомляем, что было видео. Сырой (приватный/подписанный) URL
+        # в чат НЕ публикуем — это утечка токена и он всё равно не откроется.
+        note = (caption + "\n" if caption else "") + "🎬 Видео из MAX (не удалось переслать)"
         telegram.send_to_telegram(
             self.tg_token, self.tg_group_id, note,
             disable_notification=silent,
@@ -136,6 +171,12 @@ class Bridge:
             )
         except Exception as e:
             print(f"[bridge] ошибка отправки в MAX (группа {self.max_group_id}):", e)
+            # сообщаем отправителю в TG, что доставка в MAX не удалась —
+            # иначе он думает, что всё ушло, а на деле сообщение потеряно
+            telegram.send_to_telegram(
+                self.tg_token, self.tg_group_id,
+                "⚠️ Сообщение не доставлено в MAX.",
+            )
 
     # region tg author name
     @staticmethod
@@ -175,6 +216,9 @@ class Bridge:
                     attaches.append(self.max.upload_photo(content))
                 except Exception as e:
                     print("[bridge] не удалось загрузить фото в MAX:", e)
+                    warnings.append("⚠️ Не удалось отправить фото в MAX.")
+            else:
+                warnings.append("⚠️ Не удалось скачать фото из Telegram.")
 
         # ВИДЕО (обычное видео или видео-кружочек video_note)
         video = message.get("video") or message.get("video_note")
@@ -182,8 +226,8 @@ class Bridge:
             size = video.get("file_size")
             if size and size > TG_DOWNLOAD_LIMIT:
                 warnings.append(
-                    f"⚠️ Видео не отправлено в MAX: размер {size // (1024*1024)} МБ "
-                    f"превышает лимит Telegram-ботов (20 МБ)."
+                    f"⚠️ Видео не отправлено в MAX: {size // (1024*1024)} МБ — боты "
+                    f"Telegram не могут скачивать файлы больше 20 МБ."
                 )
             else:
                 filename = video.get("file_name", "video.mp4")
@@ -193,8 +237,13 @@ class Bridge:
                         attaches.append(self.max.upload_video(content, filename=filename))
                     except Exception as e:
                         print("[bridge] не удалось загрузить видео в MAX:", e)
+                        warnings.append("⚠️ Не удалось отправить видео в MAX.")
                 else:
-                    warnings.append("⚠️ Не удалось скачать видео из Telegram (возможно, слишком большое).")
+                    # getFile отказал: чаще всего >20 МБ (file_size не всегда есть)
+                    warnings.append(
+                        "⚠️ Не удалось скачать видео из Telegram — вероятно, оно "
+                        "больше 20 МБ (лимит ботов)."
+                    )
 
         # ДОКУМЕНТ (любой файл, прикреплённый как файл)
         document = message.get("document")
@@ -202,8 +251,8 @@ class Bridge:
             size = document.get("file_size")
             if size and size > TG_DOWNLOAD_LIMIT:
                 warnings.append(
-                    f"⚠️ Файл не отправлен в MAX: размер {size // (1024*1024)} МБ "
-                    f"превышает лимит Telegram-ботов (20 МБ)."
+                    f"⚠️ Файл не отправлен в MAX: {size // (1024*1024)} МБ — боты "
+                    f"Telegram не могут скачивать файлы больше 20 МБ."
                 )
             else:
                 filename = document.get("file_name", "file.bin")
@@ -213,8 +262,12 @@ class Bridge:
                         attaches.append(self.max.upload_file(content, filename=filename))
                     except Exception as e:
                         print("[bridge] не удалось загрузить файл в MAX:", e)
+                        warnings.append("⚠️ Не удалось отправить файл в MAX.")
                 else:
-                    warnings.append("⚠️ Не удалось скачать файл из Telegram (возможно, слишком большой).")
+                    warnings.append(
+                        "⚠️ Не удалось скачать файл из Telegram — вероятно, он "
+                        "больше 20 МБ (лимит ботов)."
+                    )
 
         return attaches, warnings
 

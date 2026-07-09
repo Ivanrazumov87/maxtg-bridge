@@ -1,6 +1,7 @@
 from websockets.sync.client import connect
 from websockets.exceptions import ConnectionClosedError
 import json
+import os
 import threading
 import websockets
 import time
@@ -452,17 +453,27 @@ class MaxClient:
                 self._worker_pool.submit(self._handle_incoming, payload)
 
             case 136:
-                # вложение (файл/видео) обработано сервером — будим ожидающего
-                key = None
-                if payload and "fileId" in payload:
-                    key = f"file:{payload['fileId']}"
-                elif payload and "videoId" in payload:
-                    key = f"video:{payload['videoId']}"
-                if key is not None:
+                # вложение (файл/видео) обработано сервером — будим ожидающего.
+                # ВАЖНО: push может содержать сразу несколько id (fileId И
+                # videoId) или именовать поле иначе, поэтому НЕ выбираем один
+                # ключ через if/elif (иначе waiter под другим ключом никогда не
+                # сработает и upload висит весь wait_timeout). Перебираем все
+                # вероятные id по обоим префиксам и будим любой найденный waiter.
+                if os.getenv("MEDIA_DIAG"):
+                    print("[media-diag] push 136:",
+                          json.dumps(payload, ensure_ascii=False))
+                if payload:
+                    candidates = []
+                    for k in ("fileId", "videoId", "movieId", "id"):
+                        v = payload.get(k)
+                        if v is not None:
+                            candidates.append(f"file:{v}")
+                            candidates.append(f"video:{v}")
                     with self._upload_waiters_lock:
-                        ev = self._upload_waiters.get(key)
-                    if ev is not None:
-                        ev.set()
+                        for key in candidates:
+                            ev = self._upload_waiters.get(key)
+                            if ev is not None:
+                                ev.set()
 
             case _:
                 pass
@@ -873,6 +884,11 @@ class MaxClient:
             "notify": notify
         })
         payload = recv["payload"]
+        # сервер отклонил отправку (напр. невалидный attach) — не проглатываем
+        # молча, а поднимаем ошибку, чтобы вызывающий уведомил пользователя
+        error = payload.get("error")
+        if error:
+            raise RuntimeError(f"MAX отклонил отправку: {error} {payload.get('localizedMessage', '')}".strip())
         msg = Message(self, payload["chatId"], **payload["message"], _f=1)
         return msg
 

@@ -36,11 +36,13 @@ def download_file(token: str, file_id: str) -> bytes | None:
 
 
 def handle_attach(attach: dict) -> str:
-    match attach["_type"]:
+    # .get() вместо жёсткого subscript: у нестандартного/недообработанного
+    # attach может не быть ожидаемого ключа — не роняем обработку сообщения
+    match attach.get("_type"):
         case "FILE":
-            return attach["name"]
+            return attach.get("name") or "файл"
         case _:
-            return attach["_type"]
+            return attach.get("_type") or "вложение"
 
 
 # region send_video
@@ -144,8 +146,14 @@ def send_to_telegram(
         media = []
         not_handled_attachs = attachments.copy()
         for i, attach in enumerate(attachments):
-            if attach["_type"] == "PHOTO":
-                item = {"type": "photo", "media": attach["baseUrl"]}
+            if attach.get("_type") == "PHOTO":
+                # URL картинки может отсутствовать (недообработанное фото,
+                # линк-превью и т.п.) — тогда оставляем attach в необработанных,
+                # а не роняем всё сообщение жёстким subscript.
+                url = attach.get("baseUrl")
+                if not url:
+                    continue
+                item = {"type": "photo", "media": url}
                 not_handled_attachs.remove(attach)
                 if i == 0 and caption:
                     item["caption"] = caption
@@ -171,6 +179,11 @@ def send_to_telegram(
                 )
                 return None
 
+        # если ни одно фото не дало пригодного URL — media пуст; sendMediaGroup
+        # пустой массив не примет, поэтому шлём хотя бы текст/пометку
+        if not media:
+            return None
+
         data = {
             "chat_id": TG_CHAT_ID,
             "media": json.dumps(media),
@@ -180,6 +193,10 @@ def send_to_telegram(
         if disable_notification:
             data["disable_notification"] = True
         resp = _call(TG_BOT_TOKEN, "sendMediaGroup", data=data)
+        # фото Telegram качает с URL MAX сам; если URL под auth/referer/токеном,
+        # ответ будет ok:false — логируем причину, иначе потеря совершенно немая
+        if resp and not resp.get("ok"):
+            print("sendMediaGroup error:", resp.get("description"), "| media:", media)
         return resp
 
     # если вложений больше 10 — разобьём на несколько альбомов
