@@ -1,0 +1,9 @@
+# Секреты и локальное состояние — НЕ коммитить
+.env
+bridge_state.json
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.tmp
