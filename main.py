@@ -45,6 +45,17 @@ def onmessage(client: Client, message: Message):
     if message.sender is None or message.user is None:
         return
 
+    # АНТИ-ПЕТЛЯ (главный барьер): не пересылаем обратно наши же пересылки из TG.
+    # Бот кладёт в MAX сообщения с пометкой источника "[TG]" в начале текста —
+    # если видим её, значит это эхо нашей пересылки, а не живое сообщение.
+    if bridge.is_own_forward(message.text):
+        return
+
+    # ДЕДУП (страховка): один и тот же message.id не пересылаем дважды
+    # (повторная доставка сервером после реконнекта, гонка воркеров).
+    if not bridge.store.seen_max(message.id):
+        return
+
     msg_text = message.text
     msg_attaches = message.attaches
     try:
@@ -68,7 +79,6 @@ def onmessage(client: Client, message: Message):
             text=msg_text,
             attaches=msg_attaches,
             max_chat_id=message.chat.id,
-            cid=message.cid,
         )
 
 

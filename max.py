@@ -831,7 +831,7 @@ class MaxClient:
         return None
 
     # region send_message()
-    def send_message(self, chat_id: int, text: str, reply_id: str|int = None, notify: bool = True, on_cid=None, attaches: list = None):
+    def send_message(self, chat_id: int, text: str, reply_id: str|int = None, notify: bool = True, attaches: list = None):
         """
         Sends a text message to a specified chat.
 
@@ -860,11 +860,10 @@ class MaxClient:
             msg = client.send_message(12345678, "Replying to you!", reply_id=987654)
             ```
         """
+        # cid — протокольное поле отправки (клиентский идентификатор запроса).
+        # Для анти-петли больше НЕ используется (заменено пометкой источника и
+        # дедупом по стабильному message.id), поэтому on_cid-хук удалён.
         cid = self.cid
-        if on_cid is not None:
-            # даём вызывающему запомнить cid ДО отправки, чтобы гарантированно
-            # перехватить эхо этого сообщения (opcode 128) и не зациклить мост
-            on_cid(cid)
 
         message = {
             "text": text,

@@ -3,15 +3,24 @@
 
 Хранит:
 - offset для getUpdates Telegram (чтобы не терять и не дублировать апдейты);
-- окно cid собственных исходящих сообщений (защита от эхо-петли).
+- окна уже пересланных ID сообщений (дедупликация в обе стороны, защита от
+  повторной доставки сервером и от гонки воркеров);
+- флаг initialized — был ли уже пройден первый старт (для промотки очереди TG).
 
 Всё сериализуется в один JSON-файл. Доступ защищён реентерабельным локом,
-т.к. обращения идут из двух потоков: обработчика MAX и поллера Telegram.
+т.к. обращения идут из нескольких потоков: воркеров обработки MAX (пул) и
+поллера Telegram.
 """
 import json
 import os
 import threading
 from collections import deque
+
+# Сколько последних ID сообщений помнить для дедупликации в каждую сторону.
+# Окно нужно только чтобы отсечь ПОВТОРНУЮ доставку недавних сообщений (эхо,
+# ре-доставка сервером после реконнекта, гонка воркеров). Старые ID сервер
+# повторно не присылает, поэтому большого окна не требуется. 5000 ~ десятки КБ.
+SEEN_MAXLEN = 5000
 
 
 class BridgeStore:
@@ -19,14 +28,19 @@ class BridgeStore:
         self.path = path
         self._lock = threading.RLock()
 
-        # cid сообщений, отправленных НАМИ в MAX из Telegram. Нужны, чтобы при
-        # эхо-возврате того же сообщения по opcode 128 не переслать его обратно
-        # в Telegram (защита от петли). Держим ограниченное окно последних cid.
-        self._own_cids: deque = deque(maxlen=2000)
-        self._own_cids_set: set[int] = set()
-
         # offset для getUpdates
         self._tg_offset: int = 0
+
+        # Окна уже пересланных ID (строки — нормализуем тип, чтобы id из JSON
+        # после рестарта матчился с id входящего). deque хранит порядок для
+        # вытеснения старых, set — для O(1) проверки.
+        self._seen_max: deque = deque(maxlen=SEEN_MAXLEN)   # message.id из MAX
+        self._seen_max_set: set[str] = set()
+        self._seen_tg: deque = deque(maxlen=SEEN_MAXLEN)     # message_id из Telegram
+        self._seen_tg_set: set[str] = set()
+
+        # был ли уже первый старт (после него не проматываем очередь TG заново)
+        self._initialized: bool = False
 
         self._load()
 
@@ -41,11 +55,21 @@ class BridgeStore:
             # повреждённый файл не должен ронять бота — начинаем с чистого состояния
             return
         self._tg_offset = int(data.get("tg_offset", 0))
+        self._initialized = bool(data.get("initialized", False))
+        for k in data.get("seen_max_ids", []):
+            self._seen_max.append(str(k))
+            self._seen_max_set.add(str(k))
+        for k in data.get("seen_tg_ids", []):
+            self._seen_tg.append(str(k))
+            self._seen_tg_set.add(str(k))
 
     def _save(self):
         """Атомарная запись (через временный файл), вызывать под локом."""
         data = {
             "tg_offset": self._tg_offset,
+            "initialized": self._initialized,
+            "seen_max_ids": list(self._seen_max),
+            "seen_tg_ids": list(self._seen_tg),
         }
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -64,23 +88,46 @@ class BridgeStore:
                 self._tg_offset = offset
                 self._save()
 
-    # region own cids (anti-echo)
-    def remember_own_cid(self, cid: int):
-        """Запоминает cid сообщения, которое мы сами отправили в MAX."""
-        if cid is None:
-            return
+    # region initialized
+    @property
+    def initialized(self) -> bool:
         with self._lock:
-            if cid in self._own_cids_set:
-                return
-            if len(self._own_cids) == self._own_cids.maxlen:
-                old = self._own_cids[0]
-                self._own_cids_set.discard(old)
-            self._own_cids.append(cid)
-            self._own_cids_set.add(cid)
+            return self._initialized
 
-    def is_own_cid(self, cid: int) -> bool:
-        """True, если это эхо нашего же исходящего сообщения."""
-        if cid is None:
-            return False
+    def mark_initialized(self):
         with self._lock:
-            return cid in self._own_cids_set
+            if not self._initialized:
+                self._initialized = True
+                self._save()
+
+    # region дедупликация (атомарный check-and-add)
+    def _check_and_add(self, dq: deque, st: set, key) -> bool:
+        """
+        Атомарно: если key ещё не встречался — запомнить и вернуть True (новое,
+        надо переслать). Если уже был — вернуть False (дубль, пропустить).
+
+        key=None считаем «новым» (переслать один раз), но в окно НЕ кладём —
+        иначе первый None заглушил бы все последующие сообщения без id.
+        Проверка и добавление в одном методе под локом — чтобы параллельные
+        воркеры MAX не переслали одно сообщение дважды.
+        """
+        if key is None:
+            return True
+        key = str(key)
+        with self._lock:
+            if key in st:
+                return False
+            if len(dq) == dq.maxlen:
+                st.discard(dq[0])   # deque сам вытеснит dq[0] при append
+            dq.append(key)
+            st.add(key)
+            self._save()
+            return True
+
+    def seen_max(self, msg_id) -> bool:
+        """True, если сообщение MAX новое (надо переслать); False — дубль."""
+        return self._check_and_add(self._seen_max, self._seen_max_set, msg_id)
+
+    def seen_tg(self, msg_id) -> bool:
+        """True, если сообщение Telegram новое (надо переслать); False — дубль."""
+        return self._check_and_add(self._seen_tg, self._seen_tg_set, msg_id)

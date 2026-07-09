@@ -5,15 +5,18 @@
 - MAX -> TG: сообщение из привязанной группы MAX уходит в группу Telegram;
 - TG -> MAX: сообщение из группы Telegram отправляется в группу MAX.
 
-В обе стороны имя автора добавляется префиксом в текст («Имя: текст»), т.к. бот
-в каждом мессенджере один и слать от чужого имени нельзя. Так участники видят,
-кто из другого мессенджера написал — иллюзия единого чата.
+В обе стороны имя автора помечается источником: «Имя [MAX]: текст» в Telegram и
+«Имя [TG]: текст» в MAX. Пометка показывает людям, из какого мессенджера пишет
+человек, И служит дополнительным барьером анти-петли.
 
-Защита от эхо-петли: cid сообщений, отправленных нами в MAX из Telegram,
-запоминается; их эхо (opcode 128) обратно в Telegram не пересылается.
+Защита от петли (многослойная):
+1. Пометка источника: сообщение с «[TG]» в начале — наша пересылка, обратно не идёт.
+2. Дедуп по стабильному message.id (store) — переживает рестарт, ловит повторы.
+3. is_bot на TG-стороне — наши пересылки в TG идут от бота.
 """
 import json
 import os
+import re
 import threading
 import time
 
@@ -29,6 +32,15 @@ TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024
 # По умолчанию выключено — payload содержит подписанные URL и токены.
 MEDIA_DIAG = bool(os.getenv("MEDIA_DIAG"))
 
+# Метки источника, добавляемые к имени автора при пересылке.
+TAG_FROM_TG = "[TG]"    # в MAX: сообщение пришло из Telegram
+TAG_FROM_MAX = "[MAX]"  # в TG: сообщение пришло из MAX
+
+# Распознаёт нашу же пересылку из TG в MAX: имя автора помечено "[TG]" и дальше
+# двоеточие. Пример совпадения: "Иван Разумов [TG]: привет". Якорим на начало
+# первой строки, чтобы случайный "[TG]" внутри текста не сработал.
+_OWN_FORWARD_RE = re.compile(r"^.{0,128}?\[TG\]:\s", re.DOTALL)
+
 
 class Bridge:
     def __init__(self, max_client, tg_bot_token: str, tg_group_id: int,
@@ -42,24 +54,33 @@ class Bridge:
 
         self._stop = False
 
+    # region анти-петля
+    @staticmethod
+    def is_own_forward(text: str) -> bool:
+        """
+        True, если текст — наша же пересылка из Telegram (имя помечено «[TG]:»).
+        Такие сообщения обратно в Telegram не пересылаем (барьер анти-петли).
+        """
+        if not text:
+            return False
+        return bool(_OWN_FORWARD_RE.match(text))
+
     # region MAX -> TG
-    def on_max_message(self, name: str, text: str, attaches: list, max_chat_id: int, cid, silent: bool = False):
+    def on_max_message(self, name: str, text: str, attaches: list, max_chat_id: int, silent: bool = False):
         """
         Обрабатывает новое сообщение из группы MAX и пересылает в группу Telegram.
 
         silent=True — отправить в Telegram без уведомления.
 
-        Возврат True, если переслали; False — если пропустили (эхо/чужой чат).
+        Возврат True, если переслали; False — если пропустили (чужой чат).
         """
-        # эхо нашего же исходящего сообщения — не пересылаем обратно
-        if self.store.is_own_cid(cid):
-            return False
-
         # интересует только привязанная группа MAX
         if int(max_chat_id) != self.max_group_id:
             return False
 
-        caption = f"<b>{name}</b>\n{text}" if text else f"<b>{name}</b>"
+        # имя автора помечаем источником: «Имя [MAX]»
+        label = f"{name} {TAG_FROM_MAX}"
+        caption = f"<b>{label}</b>\n{text}" if text else f"<b>{label}</b>"
 
         # ДИАГ: печатаем сырую структуру входящих attach, чтобы увидеть реальные
         # имена полей фото/видео от сервера MAX (для точной настройки парсинга).
@@ -142,8 +163,12 @@ class Bridge:
         if str(chat.get("id")) != str(self.tg_group_id):
             return
 
-        # имя автора из Telegram -> префикс в текст (иллюзия единого чата)
-        author = self._tg_author_name(frm)
+        # ДЕДУП (страховка): один и тот же message_id не пересылаем дважды
+        if not self.store.seen_tg(message.get("message_id")):
+            return
+
+        # имя автора из Telegram + пометка источника: «Имя [TG]»
+        author = f"{self._tg_author_name(frm)} {TAG_FROM_TG}"
 
         # текст или подпись к медиа
         text = message.get("text") or message.get("caption") or ""
@@ -166,7 +191,6 @@ class Bridge:
             self.max.send_message(
                 self.max_group_id,
                 body,
-                on_cid=self.store.remember_own_cid,
                 attaches=attaches or None,
             )
         except Exception as e:
@@ -271,10 +295,29 @@ class Bridge:
 
         return attaches, warnings
 
-    # region telegram poller
+    # region skip backlog
+    def _skip_backlog_if_first_start(self):
+        """
+        При самом первом старте (нет сохранённого состояния) Telegram отдаёт всю
+        накопленную за ~24ч очередь. Промотаем её, НЕ пересылая в MAX, чтобы
+        старьё не вывалилось задним числом. Выполняется один раз за жизнь моста.
+        """
+        if self.store.initialized:
+            return
+        print("[bridge] первый старт — проматываем накопленную очередь Telegram")
+        while not self._stop:
+            updates = telegram.get_updates(
+                self.tg_token, offset=self.store.tg_offset, timeout=0,
+            )
+            if not updates:
+                break
+            self.store.set_tg_offset(updates[-1]["update_id"] + 1)
+        self.store.mark_initialized()
+
     def telegram_poll_loop(self):
         """Фоновый long-polling приём апдейтов Telegram (TG -> MAX)."""
         print("[bridge] Telegram poller запущен")
+        self._skip_backlog_if_first_start()
         while not self._stop:
             try:
                 updates = telegram.get_updates(
