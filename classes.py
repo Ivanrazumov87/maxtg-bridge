@@ -86,11 +86,14 @@ class User:
 
 # region Chat
 class Chat:
-    def __init__(self, client, chat_id):
+    def __init__(self, client, chat_id, fetch_history: bool = True):
         """
         Represents a chat in the messaging system.
 
         This class associates a chat with a client instance and its unique ID.
+        When `fetch_history` is False, the chat is created lightweight (id only),
+        without requesting message history over the socket — used on the hot path
+        of incoming-message processing where history is not needed.
         """
         if chat_id == 0:
             return
@@ -99,20 +102,23 @@ class Chat:
         self.id: int = chat_id
         self.link = f"https://web.max.ru/{chat_id}"
 
-        seq = client.seq
-        client.websocket.send(json.dumps({"ver":11,"cmd":0,"seq":seq,"opcode":49,"payload":{"chatId":chat_id,"from":int(time.time()*1000),"forward":0,"backward":30,"getMessages":True}}))
-        while True:
-            r = client.websocket.recv()
-            recv = json.loads(r)
-            if recv["seq"] == seq and recv["opcode"] == 49:
-                break
-            else:
-                pass
-        
+        if not fetch_history:
+            return
+
+        # Загрузка истории чата (opcode 49) — потокобезопасно через _send_and_wait,
+        # т.к. единственный читатель сокета это фоновый _listener.
+        recv = client._send_and_wait(49, {
+            "chatId": chat_id,
+            "from": int(time.time()*1000),
+            "forward": 0,
+            "backward": 30,
+            "getMessages": True
+        })
+
         payload = recv["payload"]
-        if not recv["opcode"] in [150]:
+        if recv.get("opcode") not in [150]:
             _ = []
-            for msg in payload["messages"]:
+            for msg in payload.get("messages", []):
                 m = Message(client, 0, **msg, _f=1)
                 _.append(m)
             self.messages: list[Message] = _
@@ -132,9 +138,13 @@ class Chat:
 
 # region Message
 class Message:
-    def __init__(self, client, chatId: str, sender: str, id, time, text, type, _f=0, **kwargs):
+    def __init__(self, client, chatId: str, sender: str = None, id=None, time=None, text="", type=None, _f=0, **kwargs):
         """
         Represents a message in a chat.
+
+        Поля sender/id/time/text/type необязательны: служебные сообщения MAX
+        (уведомления о действиях в чате и т.п.) могут не содержать их все,
+        и обработчик не должен на этом падать.
 
         This class encapsulates message details, including the sender, content, and metadata,
         and provides methods to interact with the message (e.g., reply, delete, edit).
@@ -143,8 +153,11 @@ class Message:
         self.kwargs = kwargs
         self.status = kwargs.get("status")
 
-        if not _f:
-            self.chat = Chat(client, chatId)
+        # chat.id нужен всегда (роутинг по топикам), но историю чата (сетевой
+        # запрос) грузим только когда явно запрошено (_f=0). На горячем пути
+        # обработки входящих (_f=1) создаём лёгкий chat без обращения к сокету.
+        if chatId:
+            self.chat = Chat(client, chatId, fetch_history=not _f)
         self.sender = sender
         self.id = id
         self.time = time
@@ -155,8 +168,29 @@ class Message:
         self.cid = kwargs.get("cid")
         self.attaches = kwargs.get("attaches", [])
         self.reaction_info = kwargs.get("reactionInfo", {})
-        self.user: User = client.get_user(id=sender, _f=1)
-    
+        self._user = None  # ленивый резолв: см. property user
+
+    # region user (ленивый)
+    @property
+    def user(self) -> "User":
+        """
+        Отправитель сообщения. Резолвится лениво: сначала из кэша контактов
+        (без сети), и только при отсутствии — сетевым запросом get_user.
+        Это убирает обязательный websocket round-trip на КАЖДОЕ входящее
+        (горячий путь обработки), который ранее провоцировал обрывы.
+        """
+        if self._user is not None:
+            return self._user
+        if self.sender is None:
+            return None  # служебное сообщение без отправителя
+        # пробуем кэш контактов (заполнен при логине), без обращения к сокету
+        raw = self._client.contacts.get(self.sender)
+        if raw is not None:
+            self._user = User(self._client, raw, _f=1)
+        else:
+            self._user = self._client.get_user(id=self.sender, _f=1)
+        return self._user
+
     # region reply()
     def reply(self, text: str, **kwargs) -> "Message":
         """

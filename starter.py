@@ -20,7 +20,7 @@ def run_with_restart():
                 [sys.executable, "main.py"],
                 stderr=subprocess.PIPE,
                 text=True)
-            if MONITOR_ID != "":
+            if MONITOR_ID:
                 send_to_telegram(
                     TG_BOT_TOKEN,
                     MONITOR_ID,
@@ -30,7 +30,7 @@ def run_with_restart():
             process.wait()
             exit_code = process.returncode
             stderr = process.communicate()
-            if MONITOR_ID != "" and restart_alarm:
+            if MONITOR_ID and restart_alarm:
                 send_to_telegram(
                     TG_BOT_TOKEN,
                     MONITOR_ID,
