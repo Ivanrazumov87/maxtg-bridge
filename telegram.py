@@ -70,6 +70,67 @@ def send_video(token: str, chat_id: int | str, video_url: str, caption: str = ""
     return _call(token, "sendVideo", data=data)
 
 
+# Лимит на видео, отправляемое multipart-ом через Bot API (~50 МБ). Крупнее
+# Telegram не принимает — такое видео пересылаем ссылкой/пометкой.
+TG_UPLOAD_LIMIT = 50 * 1024 * 1024
+
+# Браузерный UA — CDN OK (okcdn.ru) без него может отдать заглушку.
+_DL_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/120.0.0.0 Safari/537.36"),
+}
+
+
+# region download_url_bytes
+def download_url_bytes(url: str, limit: int = TG_UPLOAD_LIMIT) -> bytes | None:
+    """
+    Скачивает содержимое по URL (для видео из MAX, когда Telegram сам скачать
+    по ссылке не смог). Возвращает bytes или None (ошибка / превышен лимит).
+    Читает потоково и обрывается, если размер превышает limit.
+    """
+    try:
+        with requests.get(url, headers=_DL_HEADERS, stream=True, timeout=120) as r:
+            if r.status_code != 200:
+                print("download_url_bytes: HTTP", r.status_code)
+                return None
+            chunks = []
+            total = 0
+            for chunk in r.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > limit:
+                    print("download_url_bytes: файл больше лимита", limit)
+                    return None
+                chunks.append(chunk)
+            return b"".join(chunks)
+    except Exception as e:
+        print("download_url_bytes ошибка:", e)
+        return None
+
+
+# region send_video_bytes
+def send_video_bytes(token: str, chat_id: int | str, content: bytes,
+                     caption: str = "", filename: str = "video.mp4",
+                     message_thread_id: int | None = None,
+                     disable_notification: bool = False) -> dict:
+    """
+    Отправляет видео в Telegram, заливая сами байты (multipart). Работает даже
+    когда sendVideo по URL не сработал (подписанный/host-restricted CDN-URL).
+    """
+    data = {"chat_id": chat_id, "supports_streaming": True}
+    if caption:
+        data["caption"] = caption
+        data["parse_mode"] = "HTML"
+    if message_thread_id is not None:
+        data["message_thread_id"] = message_thread_id
+    if disable_notification:
+        data["disable_notification"] = True
+    files = {"video": (filename, content, "video/mp4")}
+    return _call(token, "sendVideo", data=data, files=files)
+
+
 # region createForumTopic
 def create_forum_topic(token: str, chat_id: int | str, name: str) -> int | None:
     """

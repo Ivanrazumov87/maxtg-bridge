@@ -808,13 +808,29 @@ class MaxClient:
         if diag:
             print("[diag] video_play payload keys:", list(p.keys()), "->", json.dumps(p, ensure_ascii=False)[:600])
 
-        # Структура ответа MAX может содержать набор качеств. Берём лучший
-        # доступный mp4-URL. Поддерживаем несколько вероятных схем именования.
+        # Реальная структура ответа MAX (подтверждена на живом соединении):
+        # прямые ссылки на mp4 лежат в ключах вида "MP4_360", "MP4_720", "MP4_1080"
+        # (число — высота кадра). Плюс есть "EXTERNAL" — это страница ok.ru, НЕ
+        # файл, поэтому Telegram по ней видео не скачает — берём её лишь фолбэком.
+        mp4_keys = []
+        for key, val in p.items():
+            if isinstance(key, str) and key.startswith("MP4_") and \
+               isinstance(val, str) and val.startswith("http"):
+                # сортируем по качеству (числу в имени), берём наивысшее
+                try:
+                    quality = int(key.split("_", 1)[1])
+                except (ValueError, IndexError):
+                    quality = 0
+                mp4_keys.append((quality, val))
+        if mp4_keys:
+            mp4_keys.sort(reverse=True)  # сначала лучшее качество
+            return mp4_keys[0][1]
+
+        # запасные варианты именования (на случай иных форматов ответа)
         for key in ("VIDEO_HD", "VIDEO_SD", "VIDEO_LOW", "VIDEO_MOBILE", "url", "URL"):
             val = p.get(key)
             if isinstance(val, str) and val.startswith("http"):
                 return val
-        # вариант со списком/словарём качеств
         videos = p.get("videos") or p.get("urls")
         if isinstance(videos, dict):
             for v in videos.values():
@@ -828,6 +844,12 @@ class MaxClient:
                     u = v.get("url") or v.get("URL")
                     if isinstance(u, str) and u.startswith("http"):
                         return u
+
+        # последний фолбэк: внешняя ссылка на страницу (не файл — Telegram по ней
+        # скачать не сможет, но лучше вернуть хоть что-то для диагностики выше)
+        ext = p.get("EXTERNAL")
+        if isinstance(ext, str) and ext.startswith("http"):
+            return ext
         return None
 
     # region send_message()

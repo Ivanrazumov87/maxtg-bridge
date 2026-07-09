@@ -135,15 +135,27 @@ class Bridge:
                   json.dumps(attach, ensure_ascii=False))
         url = self.max.get_video_url(video_id, token, diag=MEDIA_DIAG) if video_id is not None else None
         if url:
+            # 1) пробуем по URL — быстро, Telegram сам скачивает (если URL открыт)
             resp = telegram.send_video(
                 self.tg_token, self.tg_group_id, url,
                 caption=caption, disable_notification=silent,
             )
             if resp and resp.get("ok"):
                 return
-            print("[bridge] sendVideo не принял URL:", resp)
-        # фолбэк: уведомляем, что было видео. Сырой (приватный/подписанный) URL
-        # в чат НЕ публикуем — это утечка токена и он всё равно не откроется.
+            print("[bridge] sendVideo по URL не принял, пробуем скачать байты:", resp)
+
+            # 2) фолбэк: скачиваем видео сами и заливаем файлом (multipart).
+            # Работает с подписанными CDN-URL, которые Telegram скачать не смог.
+            content = telegram.download_url_bytes(url)
+            if content:
+                resp2 = telegram.send_video_bytes(
+                    self.tg_token, self.tg_group_id, content,
+                    caption=caption, disable_notification=silent,
+                )
+                if resp2 and resp2.get("ok"):
+                    return
+                print("[bridge] sendVideo байтами не принят:", resp2)
+        # заглушка: не смогли ни по URL, ни байтами (нет URL / >50 МБ / CDN закрыт)
         note = (caption + "\n" if caption else "") + "🎬 Видео из MAX (не удалось переслать)"
         telegram.send_to_telegram(
             self.tg_token, self.tg_group_id, note,
