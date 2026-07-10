@@ -229,6 +229,11 @@ class Bridge:
         # текст или подпись к медиа
         text = message.get("text") or message.get("caption") or ""
 
+        # голосовое/аудио уходит в MAX файлом (настоящее голосовое MAX не даёт
+        # залить через открытый протокол) — помечаем текстом, чтобы было понятно
+        if not text and (message.get("voice") or message.get("audio")):
+            text = "🎤 голосовое"
+
         # собираем вложения и заливаем их в MAX; warnings — что не удалось
         attaches, warnings = self._build_max_attaches(message)
 
