@@ -852,6 +852,43 @@ class MaxClient:
             return ext
         return None
 
+    # region get_audio_url()
+    def get_audio_url(self, audio_id, token: str = None, diag: bool = False) -> str | None:
+        """
+        Получает воспроизводимый URL голосового по audioId+token (opcode 301,
+        AUDIO_PLAY). Подтверждено на живом соединении: ответ содержит ключ
+        "opus" со ссылкой на a.oneme.ru/audio (Ogg/Opus, mono 48кГц) — это сам
+        звук, не превью. token обязателен (иначе сервер отвечает validation error).
+
+        Returns:
+            URL аудио (Ogg/Opus) или None.
+        """
+        payload = {"audioId": audio_id}
+        if token:
+            payload["token"] = token
+        try:
+            recv = self._send_and_wait(301, payload)
+        except Exception as e:
+            print("[max] get_audio_url ошибка:", e)
+            return None
+
+        p = recv.get("payload", {})
+        if diag:
+            print("[diag] audio_play (301) keys:", list(p.keys()),
+                  "->", json.dumps(p, ensure_ascii=False)[:400])
+        if "error" in p:
+            return None
+
+        # прямая ссылка на звук лежит в ключе "opus"; на случай иных форматов
+        # (например m4a/mp3) берём любую http-ссылку из значений ответа
+        opus = p.get("opus")
+        if isinstance(opus, str) and opus.startswith("http"):
+            return opus
+        for val in p.values():
+            if isinstance(val, str) and val.startswith("http"):
+                return val
+        return None
+
     # region send_message()
     def send_message(self, chat_id: int, text: str, reply_id: str|int = None, notify: bool = True, attaches: list = None):
         """

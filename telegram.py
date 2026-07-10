@@ -131,6 +131,47 @@ def send_video_bytes(token: str, chat_id: int | str, content: bytes,
     return _call(token, "sendVideo", data=data, files=files)
 
 
+# region send_voice_bytes
+def send_voice_bytes(token: str, chat_id: int | str, content: bytes,
+                     caption: str = "", filename: str = "voice.ogg",
+                     message_thread_id: int | None = None,
+                     disable_notification: bool = False) -> dict:
+    """
+    Отправляет голосовое в Telegram, заливая байты (multipart) через sendVoice.
+    Telegram ждёт ogg/opus. Если формат иной, sendVoice вернёт ok=false —
+    вызывающий код может отправить как обычный файл (документ) фолбэком.
+    """
+    data = {"chat_id": chat_id}
+    if caption:
+        data["caption"] = caption
+        data["parse_mode"] = "HTML"
+    if message_thread_id is not None:
+        data["message_thread_id"] = message_thread_id
+    if disable_notification:
+        data["disable_notification"] = True
+    files = {"voice": (filename, content, "audio/ogg")}
+    return _call(token, "sendVoice", data=data, files=files)
+
+
+# region send_document_bytes
+def send_document_bytes(token: str, chat_id: int | str, content: bytes,
+                        caption: str = "", filename: str = "file.bin",
+                        message_thread_id: int | None = None,
+                        disable_notification: bool = False) -> dict:
+    """Отправляет произвольный файл в Telegram (multipart, sendDocument).
+    Фолбэк для аудио, которое sendVoice не принял (не ogg/opus)."""
+    data = {"chat_id": chat_id}
+    if caption:
+        data["caption"] = caption
+        data["parse_mode"] = "HTML"
+    if message_thread_id is not None:
+        data["message_thread_id"] = message_thread_id
+    if disable_notification:
+        data["disable_notification"] = True
+    files = {"document": (filename, content, "application/octet-stream")}
+    return _call(token, "sendDocument", data=data, files=files)
+
+
 # region createForumTopic
 def create_forum_topic(token: str, chat_id: int | str, name: str) -> int | None:
     """

@@ -88,10 +88,14 @@ class Bridge:
             print("[media-diag] MAX->TG attaches:",
                   json.dumps(attaches, ensure_ascii=False))
 
-        # ВИДЕО из MAX обрабатываем отдельно: в attach нет прямой ссылки, поэтому
-        # запрашиваем URL по videoId/token и отправляем через sendVideo.
+        # ВИДЕО и ГОЛОСОВОЕ/АУДИО обрабатываем отдельно: в attach нет прямой
+        # ссылки, URL запрашивается по id+token. Голосовое MAX присылает как
+        # _type=UNSUPPORTED с полем audioId — распознаём по наличию audioId.
         videos = [a for a in (attaches or []) if a.get("_type") == "VIDEO"]
-        other = [a for a in (attaches or []) if a.get("_type") != "VIDEO"]
+        audios = [a for a in (attaches or []) if a.get("audioId") is not None
+                  and a.get("_type") != "VIDEO"]
+        special = {id(a) for a in videos} | {id(a) for a in audios}
+        other = [a for a in (attaches or []) if id(a) not in special]
 
         # сначала текст/фото/файлы
         if caption.strip() or other:
@@ -99,10 +103,14 @@ class Bridge:
                 self.tg_token, self.tg_group_id, caption, other,
                 disable_notification=silent,
             )
-            caption = ""  # подпись уже отправлена, не дублируем у видео
+            caption = ""  # подпись уже отправлена, не дублируем у медиа
 
         for v in videos:
             self._forward_max_video(v, caption, silent=silent)
+            caption = ""
+
+        for a in audios:
+            self._forward_max_audio(a, caption, silent=silent)
             caption = ""
 
         return True
@@ -157,6 +165,42 @@ class Bridge:
                 print("[bridge] sendVideo байтами не принят:", resp2)
         # заглушка: не смогли ни по URL, ни байтами (нет URL / >50 МБ / CDN закрыт)
         note = (caption + "\n" if caption else "") + "🎬 Видео из MAX (не удалось переслать)"
+        telegram.send_to_telegram(
+            self.tg_token, self.tg_group_id, note,
+            disable_notification=silent,
+        )
+
+    # region forward MAX audio/voice
+    def _forward_max_audio(self, attach: dict, caption: str, silent: bool = False):
+        """Получает URL голосового/аудио из MAX и отправляет в группу Telegram."""
+        audio_id = attach.get("audioId") or attach.get("id")
+        token = attach.get("token") or attach.get("audioToken")
+        url = self.max.get_audio_url(audio_id, token, diag=MEDIA_DIAG) if audio_id is not None else None
+        if url:
+            content = telegram.download_url_bytes(url)
+            if content:
+                # пробуем как голосовое (ogg/opus); если формат иной — файлом
+                resp = telegram.send_voice_bytes(
+                    self.tg_token, self.tg_group_id, content,
+                    caption=caption, disable_notification=silent,
+                )
+                if resp and resp.get("ok"):
+                    return
+                print("[bridge] sendVoice не принял, шлём документом:", resp)
+                resp2 = telegram.send_document_bytes(
+                    self.tg_token, self.tg_group_id, content,
+                    caption=caption, filename="voice.ogg",
+                    disable_notification=silent,
+                )
+                if resp2 and resp2.get("ok"):
+                    return
+                print("[bridge] sendDocument для аудио не принят:", resp2)
+        else:
+            # URL не получили — логируем, чтобы уточнить протокол (opcode/поля)
+            print("[bridge] не удалось получить URL аудио, attach:",
+                  json.dumps(attach, ensure_ascii=False))
+        # заглушка
+        note = (caption + "\n" if caption else "") + "🎤 Голосовое из MAX (не удалось переслать)"
         telegram.send_to_telegram(
             self.tg_token, self.tg_group_id, note,
             disable_notification=silent,
@@ -304,6 +348,47 @@ class Bridge:
                         "⚠️ Не удалось скачать файл из Telegram — вероятно, он "
                         "больше 20 МБ (лимит ботов)."
                     )
+
+        # ГОЛОСОВОЕ (voice) и АУДИО (audio). Отдельного upload-метода для
+        # голосового в MAX нет — заливаем файлом (в MAX появится как .ogg-файл,
+        # который можно послушать). Голосовые почти всегда мелкие (< лимита).
+        voice = message.get("voice")
+        if voice:
+            size = voice.get("file_size")
+            if size and size > TG_DOWNLOAD_LIMIT:
+                warnings.append("⚠️ Голосовое слишком большое для пересылки в MAX.")
+            else:
+                content = telegram.download_file(self.tg_token, voice["file_id"])
+                if content:
+                    try:
+                        attaches.append(self.max.upload_file(content, filename="voice.ogg"))
+                    except Exception as e:
+                        print("[bridge] не удалось загрузить голосовое в MAX:", e)
+                        warnings.append("⚠️ Не удалось отправить голосовое в MAX.")
+                else:
+                    warnings.append("⚠️ Не удалось скачать голосовое из Telegram.")
+
+        audio = message.get("audio")
+        if audio:
+            size = audio.get("file_size")
+            if size and size > TG_DOWNLOAD_LIMIT:
+                warnings.append(
+                    f"⚠️ Аудио не отправлено в MAX: {size // (1024*1024)} МБ — боты "
+                    f"Telegram не могут скачивать файлы больше 20 МБ."
+                )
+            else:
+                filename = audio.get("file_name") or (
+                    f"{audio.get('performer', '')} - {audio.get('title', 'audio')}".strip(" -") + ".mp3"
+                )
+                content = telegram.download_file(self.tg_token, audio["file_id"])
+                if content:
+                    try:
+                        attaches.append(self.max.upload_file(content, filename=filename))
+                    except Exception as e:
+                        print("[bridge] не удалось загрузить аудио в MAX:", e)
+                        warnings.append("⚠️ Не удалось отправить аудио в MAX.")
+                else:
+                    warnings.append("⚠️ Не удалось скачать аудио из Telegram.")
 
         return attaches, warnings
 
