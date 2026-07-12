@@ -92,7 +92,9 @@ class MaxClient:
     def seq(self):
         with self._seq_lock:
             current_seq = self._seq
-            self._seq += 1
+            # seq — 16-битное поле протокола: заворачиваем, чтобы при долгом
+            # аптайме не упереться в потолок и не словить разрыв соединения
+            self._seq = (self._seq + 1) % 0x10000
             return current_seq
     
     # region cid
@@ -425,27 +427,42 @@ class MaxClient:
         opcode = recv.get("opcode")
         payload = recv.get("payload")
         seq = recv.get("seq")
+        cmd = recv.get("cmd", 0)   # 0 = запрос/пуш от сервера, 1 = ответ, 3 = ошибка
 
-        # Это ответ на чей-то запрос (_send_and_wait)? Доставляем и будим ожидающего.
-        with self._pending_lock:
-            slot = self._pending.get(seq)
-        if slot is not None:
-            slot["response"] = recv
-            slot["event"].set()
+        # cmd=1/3 — это ОТВЕТ сервера на НАШ запрос. Отдаём ожидающему в _pending;
+        # если никто не ждёт (напр. ответ на heartbeat) — молча игнорируем.
+        # ОТВЕЧАТЬ НА ОТВЕТ НЕЛЬЗЯ: раньше ответ сервера на наш пинг не отличался
+        # от запроса, падал в `case 1:` и порождал новый пинг — сервер отвечал на
+        # него, и так по кругу. Каждый тик heartbeat добавлял ещё одну петлю →
+        # самоподдерживающийся ping-flood → сервер рвал TCP ("no close frame").
+        if cmd in (1, 3):
+            with self._pending_lock:
+                slot = self._pending.get(seq)
+            if slot is not None:
+                slot["response"] = recv
+                slot["event"].set()
+            elif cmd == 3:
+                print("[max] ERROR-фрейм от сервера:",
+                      json.dumps(recv, ensure_ascii=False), flush=True)
             return
 
+        # ниже — только настоящие пуши от сервера (cmd == 0). Их seq идёт по
+        # СВОЕМУ счётчику и может совпасть с нашим — поэтому в _pending лезем
+        # только для cmd=1/3 (выше), иначе пуш «съел» бы чужой ответ.
         match opcode:
             case 1:
+                # серверный ping — подтверждаем ТЕМ ЖЕ seq и cmd=1 (это ответ),
+                # ни в коем случае не новым запросом (иначе снова петля)
                 try:
                     self._raw_send(json.dumps({
                         "ver": 11,
-                        "cmd": 0,
-                        "seq": self.seq,
+                        "cmd": 1,
+                        "seq": seq,
                         "opcode": 1,
-                        "payload": {"interactive": False}
+                        "payload": {}
                     }))
-                except:
-                    pass
+                except Exception as e:
+                    print("[max] не смог ответить на серверный ping:", e, flush=True)
 
             case 128:
                 # Обработку уносим в воркер, чтобы listener не блокировался на
