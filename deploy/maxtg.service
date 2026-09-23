@@ -1,0 +1,27 @@
+# systemd-юнит моста MAX <-> Telegram.
+# Установка: см. docs/DEPLOY.md, шаг 7.
+#
+# ВАЖНО: мост при любом обрыве связи с MAX сам завершает процесс (os._exit(1)),
+# а поднимает его обратно именно systemd. Поэтому Restart=always и снятый
+# лимит рестартов (StartLimitIntervalSec=0) обязательны — без них мост
+# однажды упадёт и больше не встанет.
+
+[Unit]
+Description=MAX <-> Telegram bridge (maxtg)
+After=network-online.target
+Wants=network-online.target
+# Лимит частоты рестартов задаётся ТОЛЬКО в [Unit]. В секции [Service]
+# systemd эту строку молча игнорирует и оставляет дефолт «5 рестартов за 10 с».
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/maxtg
+ExecStart=/opt/maxtg/venv/bin/python -u main.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/maxtg.log
+StandardError=append:/var/log/maxtg.log
+
+[Install]
+WantedBy=multi-user.target
