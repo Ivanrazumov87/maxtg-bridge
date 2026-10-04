@@ -11,6 +11,12 @@ from concurrent.futures import ThreadPoolExecutor
 from classes import *
 from errors import *
 
+# Сколько ждать ответа сервера при подключении/логине (сек).
+LOGIN_TIMEOUT = 20
+# Сколько тишины от MAX считать мёртвым соединением (сек). Heartbeat раз в 25с,
+# сервер отвечает на каждый — 90с это три пропущенных ответа подряд.
+SILENCE_TIMEOUT = 90
+
 # HTTP-заголовки для загрузки файлов в MAX (как у веб-клиента)
 _UPLOAD_HEADERS = {
     "Origin": "https://web.max.ru",
@@ -69,6 +75,10 @@ class MaxClient:
         # своей эпохе и завершается, как только соединение пересоздано — это
         # гарантирует ровно один активный heartbeat и отсутствие записи в чужой сокет.
         self._conn_epoch = 0
+        # Сторож "тихого" соединения: время последнего пакета от MAX. Сервер
+        # отвечает на каждый наш heartbeat, поэтому долгая тишина означает, что
+        # соединение мёртвое, хотя TCP формально открыт.
+        self._last_recv = time.monotonic()
 
         # Кэш чатов и контактов, приходящий при логине (opcode 19).
         self.chats = {}                          # chat_id -> raw chat dict
@@ -172,7 +182,10 @@ class MaxClient:
             open_timeout=20,
         )
         self.websocket.send(self.user_agent)
-        self.websocket.recv()
+        # Все чтения до старта listener — С ТАЙМАУТОМ. Без него 27.09.2026 процесс
+        # 6+ суток висел на ожидании ответа логина: heartbeat и Telegram-поллер
+        # ещё не запущены, процесс жив — systemd не перезапускал, мост молчал.
+        self.websocket.recv(timeout=LOGIN_TIMEOUT)
 
         if _f:
             return
@@ -200,7 +213,7 @@ class MaxClient:
         # ответом на логин — читаем, пока не получим именно ответ opcode 19.
         login_resp = None
         for _ in range(10):
-            login_resp = json.loads(self.websocket.recv())
+            login_resp = json.loads(self.websocket.recv(timeout=LOGIN_TIMEOUT))
             if login_resp.get("opcode") == 19:
                 break
 
@@ -351,6 +364,11 @@ class MaxClient:
             # устарел и завершается, чтобы не писать в новый сокет
             if epoch is not None and epoch != self._conn_epoch:
                 return
+            silence = time.monotonic() - self._last_recv
+            if silence > SILENCE_TIMEOUT:
+                print(f"MAX молчит {int(silence)}с (нет ответов на heartbeat) — "
+                      "соединение мёртвое. Перезапуск процесса (systemd)...", flush=True)
+                self._exit_for_restart()
             try:
                 self._raw_send(json.dumps({
                     "ver": 11,
@@ -424,6 +442,7 @@ class MaxClient:
 
     def _process_message(self, recv):
         """Process a single message"""
+        self._last_recv = time.monotonic()
         opcode = recv.get("opcode")
         payload = recv.get("payload")
         seq = recv.get("seq")
@@ -513,7 +532,20 @@ class MaxClient:
             client.run()
             ```
         """
-        self.connect()
+        try:
+            self.connect()
+        except Exception as e:
+            # Таймаут/отказ логина: не висим и не оставляем полуживой процесс —
+            # выходим, systemd (Restart=always) поднимет заново.
+            # Сюда же попадают ошибки колбэка on_connect — без перехвата они
+            # тоже роняли бы процесс (и systemd рестартил бы), поэтому поведение
+            # то же; traceback печатаем, чтобы причина была видна в логе.
+            import traceback
+            traceback.print_exc()
+            print(f"Не удалось подключиться к MAX: {type(e).__name__}: {e}. "
+                  "Перезапуск процесса (systemd)...", flush=True)
+            self._exit_for_restart()
+        self._last_recv = time.monotonic()
         self._t = threading.Thread(target=self._listener, name="WebMaxListener")
         self._t.daemon = True  # Добавляем daemon=True для автоматического завершения
         self._t.start()
