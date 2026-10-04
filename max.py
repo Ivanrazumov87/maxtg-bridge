@@ -878,6 +878,9 @@ class MaxClient:
                     quality = 0
                 mp4_keys.append((quality, val))
         mp4_keys.sort(reverse=True)  # сначала лучшее качество
+        # в лог: какие качества отдал сервер (нужно для разбора непересланных видео)
+        print(f"[max] видео {video_id}: качества {[q for q, _ in mp4_keys]}, "
+              f"ключи ответа {sorted(k for k in p.keys() if isinstance(k, str))}", flush=True)
         for _, val in mp4_keys:
             add(val)
 

@@ -101,7 +101,8 @@ def download_url_bytes(url: str, limit: int = TG_UPLOAD_LIMIT) -> bytes | None:
                     continue
                 total += len(chunk)
                 if total > limit:
-                    print("download_url_bytes: файл больше лимита", limit)
+                    print("download_url_bytes: файл больше лимита", limit,
+                          "| Content-Length:", r.headers.get("Content-Length"))
                     return None
                 chunks.append(chunk)
             return b"".join(chunks)

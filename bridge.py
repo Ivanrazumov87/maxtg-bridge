@@ -246,6 +246,7 @@ class Bridge:
 
         # предупреждения (напр. слишком большой файл) шлём обратно в ту же группу
         for w in warnings:
+            print("[bridge] TG->MAX предупреждение:", w, flush=True)
             telegram.send_to_telegram(self.tg_token, self.tg_group_id, w)
 
         # служебное сообщение без текста и без вложений — пропускаем
