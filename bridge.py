@@ -141,11 +141,11 @@ class Bridge:
             # не смогли определить id — логируем сырой attach, чтобы понять схему
             print("[bridge] VIDEO-attach без распознанного id:",
                   json.dumps(attach, ensure_ascii=False))
-        url = self.max.get_video_url(video_id, token, diag=MEDIA_DIAG) if video_id is not None else None
-        if url:
-            # 1) пробуем по URL — быстро, Telegram сам скачивает (если URL открыт)
+        urls = self.max.get_video_urls(video_id, token, diag=MEDIA_DIAG) if video_id is not None else []
+        if urls:
+            # 1) пробуем по URL лучшего качества — Telegram сам скачивает (если URL открыт)
             resp = telegram.send_video(
-                self.tg_token, self.tg_group_id, url,
+                self.tg_token, self.tg_group_id, urls[0],
                 caption=caption, disable_notification=silent,
             )
             if resp and resp.get("ok"):
@@ -154,13 +154,20 @@ class Bridge:
 
             # 2) фолбэк: скачиваем видео сами и заливаем файлом (multipart).
             # Работает с подписанными CDN-URL, которые Telegram скачать не смог.
-            content = telegram.download_url_bytes(url)
-            if content:
+            # Перебираем качество от лучшего к худшему: 1080p длинного видео
+            # часто больше 50 МБ (лимит бота), а 720p/360p того же видео влезает.
+            for i, url in enumerate(urls):
+                content = telegram.download_url_bytes(url)
+                if not content:
+                    continue
                 resp2 = telegram.send_video_bytes(
                     self.tg_token, self.tg_group_id, content,
                     caption=caption, disable_notification=silent,
                 )
                 if resp2 and resp2.get("ok"):
+                    if i > 0:
+                        print(f"[bridge] видео отправлено в пониженном качестве "
+                              f"(вариант {i + 1} из {len(urls)}, {len(content) // 1048576} МБ)")
                     return
                 print("[bridge] sendVideo байтами не принят:", resp2)
         # заглушка: не смогли ни по URL, ни байтами (нет URL / >50 МБ / CDN закрыт)

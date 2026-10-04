@@ -128,7 +128,8 @@ def send_video_bytes(token: str, chat_id: int | str, content: bytes,
     if disable_notification:
         data["disable_notification"] = True
     files = {"video": (filename, content, "video/mp4")}
-    return _call(token, "sendVideo", data=data, files=files)
+    # файл до 50 МБ: Telegram обрабатывает его дольше, чем обычный запрос
+    return _call(token, "sendVideo", data=data, files=files, timeout=120)
 
 
 # region send_voice_bytes

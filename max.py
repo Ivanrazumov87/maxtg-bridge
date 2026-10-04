@@ -833,16 +833,18 @@ class MaxClient:
 
         return {"_type": "VIDEO", "videoId": video_id, "token": token}
 
-    # region get_video_url()
-    def get_video_url(self, video_id, token: str = None, diag: bool = False) -> str | None:
+    # region get_video_urls()
+    def get_video_urls(self, video_id, token: str = None, diag: bool = False) -> list[str]:
         """
-        Получает воспроизводимый URL видео по videoId (opcode 83 VIDEO_PLAY).
+        Получает прямые ссылки на файл видео по videoId (opcode 83 VIDEO_PLAY).
 
         В attach входящего видео нет прямой ссылки — только videoId/token, поэтому
         для пересылки в Telegram нужно запросить URL отдельно.
 
         Returns:
-            URL видео (предпочтительно mp4) или None, если не удалось.
+            Список URL от лучшего качества к худшему (пустой, если не удалось).
+            Несколько вариантов нужны потому, что 1080p длинного видео часто
+            больше лимита бота Telegram (50 МБ), а 720p/360p того же видео влезает.
         """
         payload = {"videoId": video_id}
         if token:
@@ -850,56 +852,49 @@ class MaxClient:
         try:
             recv = self._send_and_wait(83, payload)
         except Exception as e:
-            print("[max] get_video_url ошибка:", e)
-            return None
+            print("[max] get_video_urls ошибка:", e)
+            return []
 
         p = recv.get("payload", {})
         if diag:
             print("[diag] video_play payload keys:", list(p.keys()), "->", json.dumps(p, ensure_ascii=False)[:600])
 
+        urls = []
+
+        def add(u):
+            if isinstance(u, str) and u.startswith("http") and u not in urls:
+                urls.append(u)
+
         # Реальная структура ответа MAX (подтверждена на живом соединении):
         # прямые ссылки на mp4 лежат в ключах вида "MP4_360", "MP4_720", "MP4_1080"
-        # (число — высота кадра). Плюс есть "EXTERNAL" — это страница ok.ru, НЕ
-        # файл, поэтому Telegram по ней видео не скачает — берём её лишь фолбэком.
+        # (число — высота кадра). "EXTERNAL" — это страница ok.ru, НЕ файл:
+        # ни Telegram, ни мы скачать по ней видео не можем, поэтому не берём.
         mp4_keys = []
         for key, val in p.items():
-            if isinstance(key, str) and key.startswith("MP4_") and \
-               isinstance(val, str) and val.startswith("http"):
-                # сортируем по качеству (числу в имени), берём наивысшее
+            if isinstance(key, str) and key.startswith("MP4_") and                isinstance(val, str) and val.startswith("http"):
                 try:
                     quality = int(key.split("_", 1)[1])
                 except (ValueError, IndexError):
                     quality = 0
                 mp4_keys.append((quality, val))
-        if mp4_keys:
-            mp4_keys.sort(reverse=True)  # сначала лучшее качество
-            return mp4_keys[0][1]
+        mp4_keys.sort(reverse=True)  # сначала лучшее качество
+        for _, val in mp4_keys:
+            add(val)
 
         # запасные варианты именования (на случай иных форматов ответа)
         for key in ("VIDEO_HD", "VIDEO_SD", "VIDEO_LOW", "VIDEO_MOBILE", "url", "URL"):
-            val = p.get(key)
-            if isinstance(val, str) and val.startswith("http"):
-                return val
+            add(p.get(key))
         videos = p.get("videos") or p.get("urls")
         if isinstance(videos, dict):
             for v in videos.values():
-                if isinstance(v, str) and v.startswith("http"):
-                    return v
+                add(v)
         if isinstance(videos, list):
             for v in videos:
-                if isinstance(v, str) and v.startswith("http"):
-                    return v
                 if isinstance(v, dict):
-                    u = v.get("url") or v.get("URL")
-                    if isinstance(u, str) and u.startswith("http"):
-                        return u
-
-        # последний фолбэк: внешняя ссылка на страницу (не файл — Telegram по ней
-        # скачать не сможет, но лучше вернуть хоть что-то для диагностики выше)
-        ext = p.get("EXTERNAL")
-        if isinstance(ext, str) and ext.startswith("http"):
-            return ext
-        return None
+                    add(v.get("url") or v.get("URL"))
+                else:
+                    add(v)
+        return urls
 
     # region get_audio_url()
     def get_audio_url(self, audio_id, token: str = None, diag: bool = False) -> str | None:
