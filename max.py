@@ -25,6 +25,19 @@ _UPLOAD_HEADERS = {
                   "(KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
 }
 
+
+def _account_profile(profile: dict) -> dict:
+    """Данные аккаунта из ответа на вход (opcode 19).
+
+    С 16.11.2026 MAX кладёт их не прямо в profile, а в profile.contact
+    (рядом - profileOptions). Без этого User() падает на KeyError 'id',
+    connect() не проходит, и мост уходит в цикл перезапусков. Старый формат
+    (id прямо в profile) тоже принимаем - на случай, если MAX вернёт его.
+    """
+    if "id" not in profile and isinstance(profile.get("contact"), dict):
+        return profile["contact"]
+    return profile
+
 # region class MaxClient
 class MaxClient:
     def __init__(self, token: str|None = None, phone: str|None = None):
@@ -230,7 +243,7 @@ class MaxClient:
                 f"Ключи: {list(p.keys())}"
             )
 
-        usr = User(self, p['profile'])
+        usr = User(self, _account_profile(p['profile']))
         self.me = usr
 
         # Сохраняем чаты и контакты из ответа логина — они нужны для
@@ -666,7 +679,7 @@ class MaxClient:
                 continue
 
         self.auth_token = payload['tokenAttrs']['LOGIN']['token']
-        usr = User(self, payload['profile'])
+        usr = User(self, _account_profile(payload['profile']))
         self.me = usr
         return self.me
 
