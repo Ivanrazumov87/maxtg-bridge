@@ -10,6 +10,9 @@ from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
 from classes import *
 from errors import *
+# С 18.11.2026 MAX говорит двоичными кадрами на новом адресе - см. proto.py
+from proto import (encode_frame, decode_frame, FrameError,
+                   WS_URL, ORIGIN, APP_VERSION, SEQ_MOD)
 
 # Сколько ждать ответа сервера при подключении/логине (сек).
 LOGIN_TIMEOUT = 20
@@ -116,8 +119,10 @@ class MaxClient:
         with self._seq_lock:
             current_seq = self._seq
             # seq — 16-битное поле протокола: заворачиваем, чтобы при долгом
-            # аптайме не упереться в потолок и не словить разрыв соединения
-            self._seq = (self._seq + 1) % 0x10000
+            # аптайме не упереться в потолок и не словить разрыв соединения.
+            # С 18.11.2026 в двоичном кадре seq - знаковое int16 (proto.py),
+            # поэтому круг 0..32767, как у веб-клиента MAX.
+            self._seq = (self._seq + 1) % SEQ_MOD
             return current_seq
     
     # region cid
@@ -131,8 +136,11 @@ class MaxClient:
         return int("900"+str(int(time.time())))
 
     # region _generate_user_agent()
-    def _generate_user_agent(self) -> str:
-        return json.dumps({
+    def _generate_user_agent(self) -> dict:
+        # С 18.11.2026 - поля как у веб-клиента MAX 26.11.9 (проверено пробой
+        # входа); прежние appVersion 4.8.42 / "WebMax Lib" ушли вместе со
+        # старым адресом ws-api.oneme.ru.
+        return {
             "ver": 11,
             "cmd": 0,
             "seq": self.seq,
@@ -140,18 +148,20 @@ class MaxClient:
             "payload": {
                 "userAgent": {
                     "deviceType": "WEB",
-                    "locale": "en",
+                    "locale": "ru",
                     "osVersion": "Windows",
-                    "deviceName": "WebMax Lib",
-                    "headerUserAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
-                    "deviceLocale": "en",
-                    "appVersion": "4.8.42",
-                    "screen": "1920x1080 1.0x",
-                    "timezone": "UTC"
+                    "deviceName": "Chrome",
+                    "headerUserAgent": _UPLOAD_HEADERS["User-Agent"],
+                    "deviceLocale": "ru",
+                    "appVersion": APP_VERSION,
+                    "screen": "1080x1920 1.0x",
+                    "timezone": "Europe/Moscow"
                 },
-                "deviceId": str(uuid4())
+                "deviceId": str(uuid4()),
+                # __init__ зовёт этот метод раньше, чем заводит session_id
+                "clientSessionId": int(time.time() * 1000),
             }
-        })
+        }
 
     # region connect()
     def connect(self, _f=None, _reconnect=False):
@@ -176,10 +186,10 @@ class MaxClient:
         if self._connected:
             return
         headers = [
-            ("Origin", "https://web.oneme.ru"),
+            ("Origin", ORIGIN),
             ("Pragma", "no-cache"),
             ("Cache-Control", "no-cache"),
-            ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36")
+            ("User-Agent", _UPLOAD_HEADERS["User-Agent"])
         ]
         # ВАЖНО: ping_interval=None отключает встроенный WS-keepalive библиотеки.
         # MAX не отвечает на низкоуровневый WS-Ping (у него свой прикладной
@@ -187,18 +197,22 @@ class MaxClient:
         # ожидание Pong) ложно рвёт соединение с "no close frame", особенно когда
         # воркер занят обработкой входящего. Свой heartbeat (_heartbeat) держит
         # соединение сам.
+        # С 18.11.2026 - новый адрес и двоичные кадры (proto.py): старый
+        # wss://ws-api.oneme.ru/websocket больше не принимает соединения.
         self.websocket = connect(
-            "wss://ws-api.oneme.ru/websocket",
+            WS_URL,
             additional_headers=headers,
             ping_interval=None,
             ping_timeout=None,
             open_timeout=20,
         )
-        self.websocket.send(self.user_agent)
+        self.websocket.send(encode_frame(self.user_agent))
         # Все чтения до старта listener — С ТАЙМАУТОМ. Без него 27.09.2026 процесс
         # 6+ суток висел на ожидании ответа логина: heartbeat и Telegram-поллер
         # ещё не запущены, процесс жив — systemd не перезапускал, мост молчал.
-        self.websocket.recv(timeout=LOGIN_TIMEOUT)
+        hello = decode_frame(self.websocket.recv(timeout=LOGIN_TIMEOUT))
+        if hello.get("cmd") == 3:
+            raise ValueError(f"MAX отклонил подключение (opcode 6): {hello.get('payload')}")
 
         if _f:
             return
@@ -206,7 +220,7 @@ class MaxClient:
         # Логин выполняется ДО старта фонового listener, поэтому читаем сокет
         # синхронно здесь (механизм _send_and_wait ещё не обслуживается).
         login_seq = self.seq
-        self.websocket.send(json.dumps({
+        self.websocket.send(encode_frame({
             "ver": 11,
             "cmd": 0,
             "seq": login_seq,
@@ -226,7 +240,7 @@ class MaxClient:
         # ответом на логин — читаем, пока не получим именно ответ opcode 19.
         login_resp = None
         for _ in range(10):
-            login_resp = json.loads(self.websocket.recv(timeout=LOGIN_TIMEOUT))
+            login_resp = decode_frame(self.websocket.recv(timeout=LOGIN_TIMEOUT))
             if login_resp.get("opcode") == 19:
                 break
 
@@ -297,10 +311,13 @@ class MaxClient:
         self.auth_token = token
 
     # region _raw_send()
-    def _raw_send(self, data: str):
-        """Потокобезопасная запись в сокет. Все отправки идут через этот метод."""
+    def _raw_send(self, data):
+        """Потокобезопасная запись в сокет. Все отправки идут через этот метод.
+        data - словарь кадра или строка JSON (старые места вызова); в сокет
+        уходит двоичный кадр (proto.py, с 18.11.2026)."""
+        frame = encode_frame(data)
         with self._send_lock:
-            self.websocket.send(data)
+            self.websocket.send(frame)
 
     # region _send_and_wait()
     def _send_and_wait(self, opcode: int, payload: dict, timeout: float = 15.0) -> dict:
@@ -399,23 +416,38 @@ class MaxClient:
                 time.sleep(1)
 
 
+    # region _recv_frame()
+    def _recv_frame(self, timeout=None):
+        """Читает и разбирает один кадр. Кадр, который не удалось разобрать
+        (FrameError), пропускается с записью в лог: если какой-то вид пушей
+        MAX не разбирается, перезапуск процесса не поможет - мост ушёл бы
+        в бесконечный цикл рестартов (с 18.11.2026)."""
+        data = self.websocket.recv(timeout=timeout)
+        try:
+            return decode_frame(data)
+        except FrameError as e:
+            print(f"[max] кадр пропущен, не разобран: {e}", flush=True)
+            return None
+
     # region _listener()
     def _listener(self):
         """Listener with batch processing for multiple messages"""
         while not self._t_stop:
             try:
                 # Получаем первое сообщение
-                recv = json.loads(self.websocket.recv())
+                recv = self._recv_frame()
 
                 # Обрабатываем первое сообщение
-                self._process_message(recv)
+                if recv is not None:
+                    self._process_message(recv)
 
                 # Проверяем, есть ли еще сообщения в буфере
                 while True:
                     try:
                         # Пытаемся получить следующее сообщение с таймаутом 0.01 сек
-                        next_msg = json.loads(self.websocket.recv(timeout=0.01))
-                        self._process_message(next_msg)
+                        next_msg = self._recv_frame(timeout=0.01)
+                        if next_msg is not None:
+                            self._process_message(next_msg)
                     except TimeoutError:
                         # Больше нет сообщений в буфере
                         break
@@ -474,8 +506,9 @@ class MaxClient:
                 slot["response"] = recv
                 slot["event"].set()
             elif cmd == 3:
+                # default=repr: в msgpack бывают bytes, json их не печатает
                 print("[max] ERROR-фрейм от сервера:",
-                      json.dumps(recv, ensure_ascii=False), flush=True)
+                      json.dumps(recv, ensure_ascii=False, default=repr), flush=True)
             return
 
         # ниже — только настоящие пуши от сервера (cmd == 0). Их seq идёт по
@@ -486,13 +519,15 @@ class MaxClient:
                 # серверный ping — подтверждаем ТЕМ ЖЕ seq и cmd=1 (это ответ),
                 # ни в коем случае не новым запросом (иначе снова петля)
                 try:
-                    self._raw_send(json.dumps({
+                    # payload None = пустое тело кадра: так отвечает и веб-клиент
+                    # MAX (код web.max.ru, 18.11.2026)
+                    self._raw_send({
                         "ver": 11,
                         "cmd": 1,
                         "seq": seq,
                         "opcode": 1,
-                        "payload": {}
-                    }))
+                        "payload": None
+                    })
                 except Exception as e:
                     print("[max] не смог ответить на серверный ping:", e, flush=True)
 
@@ -510,7 +545,7 @@ class MaxClient:
                 # вероятные id по обоим префиксам и будим любой найденный waiter.
                 if os.getenv("MEDIA_DIAG"):
                     print("[media-diag] push 136:",
-                          json.dumps(payload, ensure_ascii=False))
+                          json.dumps(payload, ensure_ascii=False, default=repr))
                 if payload:
                     candidates = []
                     for k in ("fileId", "videoId", "movieId", "id"):
@@ -603,7 +638,7 @@ class MaxClient:
         if self.is_log_in:
             raise ValueError("Client is logged in now")
         
-        self.websocket.send(json.dumps({
+        self.websocket.send(encode_frame({
             "ver": 11,
             "cmd": 0,
             "seq": self.seq,
@@ -615,11 +650,11 @@ class MaxClient:
             }
         }))
 
-        return json.loads(self.websocket.recv()) # experimental
+        return decode_frame(self.websocket.recv(timeout=LOGIN_TIMEOUT)) # experimental
     
     # region _check_code()
     def _check_code(self, token, code) -> dict:
-        self.websocket.send(json.dumps({
+        self.websocket.send(encode_frame({
             "ver": 11,
             "cmd": 0,
             "seq": self.seq,
@@ -631,7 +666,7 @@ class MaxClient:
             }
         }))
 
-        token_resp = json.loads(self.websocket.recv())
+        token_resp = decode_frame(self.websocket.recv(timeout=LOGIN_TIMEOUT))
         payload = token_resp['payload']
         error = token_resp['payload'].get("error", None)
 
